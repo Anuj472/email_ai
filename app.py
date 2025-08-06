@@ -11,7 +11,10 @@ def create_app(config_name='default'):
     app.config.from_object(config[config_name])
     
     # Enable CORS
-    CORS(app, origins=["http://localhost:3000", "http://127.0.0.1:3000"])
+    CORS(app, 
+         origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         allow_headers=["Content-Type", "Authorization"])
     
     # Configure logging
     if not app.debug:
@@ -19,13 +22,25 @@ def create_app(config_name='default'):
     
     # Create upload directory
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    print(f"✅ Upload directory created: {app.config['UPLOAD_FOLDER']}")
     
     # Register blueprints
-    from routes.chat_routes import chat_bp
-    from routes.file_routes import file_bp
-    
-    app.register_blueprint(chat_bp, url_prefix='/api/chat')
-    app.register_blueprint(file_bp, url_prefix='/api/files')
+    try:
+        from routes.chat_routes import chat_bp
+        from routes.file_routes import file_bp
+        
+        app.register_blueprint(chat_bp, url_prefix='/api/chat')
+        app.register_blueprint(file_bp, url_prefix='/api/files')
+        
+        print("✅ Blueprints registered successfully")
+        
+        # Print all registered routes for debugging
+        print("\n📋 Registered routes:")
+        for rule in app.url_map.iter_rules():
+            print(f"  {rule.methods} {rule}")
+            
+    except ImportError as e:
+        print(f"❌ Error importing blueprints: {e}")
     
     @app.route('/')
     def index():
