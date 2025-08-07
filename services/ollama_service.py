@@ -1,6 +1,7 @@
 import requests
 import json
 import logging
+import re
 from typing import Dict, List, Optional
 from flask import current_app
 
@@ -10,48 +11,33 @@ class OllamaService:
     def __init__(self):
         self.base_url = current_app.config['OLLAMA_BASE_URL']
         self.model = current_app.config['OLLAMA_MODEL']
-        self.timeout = current_app.config.get('OLLAMA_TIMEOUT', 60)
+        self.timeout = current_app.config.get('OLLAMA_TIMEOUT', 120)
 
-    def generate_email_reply_with_context(self, document_content: str, user_request: str, context: Dict = None) -> Dict:
-        """Generate email reply with full conversation context and memory"""
+    def generate_professional_response(self, user_message: str, document_content: str, context: Dict = None) -> Dict:
+        """Generate professional response with enhanced prompts and word count control"""
         try:
-            # Build comprehensive context from chat history
-            chat_history = context.get('chat_history', []) if context else []
+            if not context:
+                context = {}
+
+            # ✅ NEW: Professional system prompt
+            system_prompt = self._build_professional_system_prompt(context)
             
-            # Extract all user requests and information from chat history
-            conversation_context = self._build_conversation_context(chat_history, user_request)
+            # ✅ NEW: Enhanced user prompt with word count control
+            enhanced_prompt = self._build_enhanced_user_prompt(user_message, document_content, context)
             
-            prompt = f"""You are a professional email assistant with perfect memory. You remember ALL previous conversations and requests from the user in this session.
-
-DOCUMENT CONTENT:
-{document_content[:2000]}...
-
-CONVERSATION HISTORY AND CONTEXT:
-{conversation_context}
-
-CURRENT USER REQUEST:
-{user_request}
-
-DOCUMENT SUBJECT: {context.get('document_subject', 'N/A') if context else 'N/A'}
-
-IMPORTANT INSTRUCTIONS:
-1. Remember and consider ALL previous information the user has provided in this conversation
-2. Build upon previous requests and information - don't ignore or forget anything
-3. If the user is adding more information, incorporate it with previously provided details
-4. Generate a comprehensive email reply that considers the ENTIRE conversation context
-5. Use proper email formatting with clear structure
-
-Please generate a professional email reply that incorporates ALL the information from our entire conversation:"""
+            # ✅ NEW: Determine response length based on context
+            word_count_params = self._determine_response_length(user_message, context)
 
             payload = {
                 "model": self.model,
-                "prompt": prompt,
+                "system": system_prompt,
+                "prompt": enhanced_prompt,
                 "stream": False,
                 "options": {
                     "temperature": 0.7,
-                    "num_predict": 800,
                     "top_p": 0.9,
-                    "repeat_penalty": 1.1
+                    "num_predict": word_count_params['max_tokens'],
+                    "num_ctx": 4096
                 }
             }
 
@@ -63,90 +49,240 @@ Please generate a professional email reply that incorporates ALL the information
 
             if response.status_code == 200:
                 result = response.json()
-                formatted_email = self._format_email_reply(result.get('response', '').strip())
+                generated_text = result.get('response', '').strip()
                 
+                # ✅ NEW: Count words and validate length
+                word_count = len(generated_text.split())
+                
+                # ✅ NEW: Ensure minimum length requirement
+                if word_count < word_count_params['min_words']:
+                    generated_text = self._expand_response(generated_text, word_count_params['min_words'])
+                    word_count = len(generated_text.split())
+
                 return {
                     'success': True,
-                    'response': formatted_email
+                    'response': generated_text,
+                    'word_count': word_count,
+                    'response_type': self._classify_response_type(user_message),
+                    'professional_mode': True,
+                    'model': self.model
                 }
             else:
+                logger.error(f"Ollama API error: {response.status_code}")
                 return {
                     'success': False,
-                    'error': 'Failed to generate email reply'
+                    'error': f'Ollama service error: {response.status_code}',
+                    'fallback': self._get_professional_fallback()
                 }
 
-        except Exception as e:
-            logger.error(f"Error in contextual email generation: {str(e)}")
+        except requests.exceptions.Timeout:
+            logger.error("Ollama request timeout")
             return {
                 'success': False,
-                'error': 'Email generation failed'
+                'error': 'Request timeout - response may be too long',
+                'fallback': self._get_professional_fallback()
+            }
+        except Exception as e:
+            logger.error(f"Error in professional response generation: {str(e)}")
+            return {
+                'success': False,
+                'error': f'Professional response error: {str(e)}',
+                'fallback': self._get_professional_fallback()
             }
 
-    def generate_chat_response_with_context(self, user_message: str, document_content: str, selected_file: Dict, chat_history: List) -> Dict:
-        """Generate conversational response with full conversation memory"""
+    def _build_professional_system_prompt(self, context: Dict) -> str:
+        """Build enhanced system prompt for professional responses"""
+        
+        domains = context.get('professional_domains', [])
+        
+        system_prompt = """You are a Professional Technical AI Assistant specializing in:
+
+🔧 SOFTWARE DEVELOPMENT & PROGRAMMING
+- Code review, optimization, and best practices
+- Architecture design and system scalability
+- Debugging, testing, and deployment strategies
+- Multiple programming languages and frameworks
+
+⚡ ELECTRONICS & HARDWARE ENGINEERING  
+- Circuit design and component selection
+- PCB layout and signal integrity
+- Embedded systems and microcontroller programming
+- Power management and thermal analysis
+
+🏗️ SYSTEMS ARCHITECTURE & DESIGN
+- Distributed systems and cloud architecture
+- Database design and optimization
+- API design and integration patterns
+- Performance tuning and scalability
+
+📋 TECHNICAL DOCUMENTATION & COMMUNICATION
+- Professional technical writing
+- Requirements analysis and specification
+- User guides and API documentation
+- Project management and team communication
+
+RESPONSE GUIDELINES:
+✅ Provide detailed, technical explanations
+✅ Include practical examples and code snippets when relevant
+✅ Suggest best practices and industry standards
+✅ Consider scalability, security, and maintainability
+✅ Use professional language and clear structure
+✅ Adapt response length based on complexity and user request
+
+WORD COUNT CONTROL:
+- Short responses (50-200 words): Quick answers, confirmations, simple explanations
+- Medium responses (200-800 words): Standard technical explanations, code reviews
+- Long responses (800-3000 words): Comprehensive analysis, detailed documentation, complex solutions
+- Custom word count: When user specifies, aim for that target ±10%
+
+Always prioritize accuracy, professionalism, and practical value in your responses."""
+
+        return system_prompt
+
+    def _build_enhanced_user_prompt(self, user_message: str, document_content: str, context: Dict) -> str:
+        """Build enhanced user prompt with document context"""
+        
+        prompt_parts = []
+        
+        # Document context
+        if document_content:
+            prompt_parts.append(f"""
+DOCUMENT CONTEXT:
+Subject: {context.get('document_subject', 'Technical Document')}
+Content: {document_content[:3000]}...
+
+""")
+
+        # Chat history context
+        chat_history = context.get('chat_history', [])
+        if chat_history:
+            recent_history = chat_history[-3:]  # Last 3 messages for context
+            prompt_parts.append("CONVERSATION CONTEXT:\n")
+            for msg in recent_history:
+                role = "User" if msg.get('isUser') else "Assistant"
+                prompt_parts.append(f"{role}: {msg.get('text', '')[:200]}...\n")
+            prompt_parts.append("\n")
+
+        # Word count instruction
+        requested_words = context.get('requested_word_count')
+        if requested_words:
+            prompt_parts.append(f"SPECIFIC INSTRUCTION: Provide your response in approximately {requested_words} words.\n\n")
+
+        # User request
+        prompt_parts.append(f"USER REQUEST: {user_message}")
+
+        return "".join(prompt_parts)
+
+    def _determine_response_length(self, user_message: str, context: Dict) -> Dict:
+        """Determine appropriate response length based on user request and context"""
+        
+        # Check for explicit word count request
+        word_count_match = re.search(r'(?:in|about|around|approximately)\s+(\d+)\s+words?', user_message, re.IGNORECASE)
+        if word_count_match:
+            requested_words = int(word_count_match.group(1))
+            # Clamp to allowed range
+            requested_words = max(50, min(3000, requested_words))
+            return {
+                'min_words': max(50, requested_words - 50),
+                'target_words': requested_words,
+                'max_tokens': min(4000, requested_words * 2)
+            }
+
+        # Analyze request complexity
+        complexity_indicators = [
+            'explain', 'analyze', 'detailed', 'comprehensive', 'thorough',
+            'architecture', 'design', 'implementation', 'documentation',
+            'review', 'optimization', 'best practices'
+        ]
+        
+        short_indicators = [
+            'quick', 'brief', 'summary', 'simple', 'what is', 'define'
+        ]
+
+        message_lower = user_message.lower()
+        
+        if any(indicator in message_lower for indicator in short_indicators):
+            return {'min_words': 50, 'target_words': 150, 'max_tokens': 300}
+        elif any(indicator in message_lower for indicator in complexity_indicators):
+            return {'min_words': 300, 'target_words': 800, 'max_tokens': 1600}
+        else:
+            return {'min_words': 100, 'target_words': 400, 'max_tokens': 800}
+
+    def _expand_response(self, response: str, min_words: int) -> str:
+        """Expand response if it's too short"""
+        current_words = len(response.split())
+        if current_words >= min_words:
+            return response
+            
+        # Add professional expansion
+        expansion = "\n\nAdditional considerations and best practices to keep in mind for this topic include proper documentation, testing methodologies, and scalability planning for future requirements."
+        
+        return response + expansion
+
+    def _classify_response_type(self, user_message: str) -> str:
+        """Classify the type of response being generated"""
+        message_lower = user_message.lower()
+        
+        if any(keyword in message_lower for keyword in ['code', 'programming', 'function', 'algorithm']):
+            return 'code_analysis'
+        elif any(keyword in message_lower for keyword in ['circuit', 'electronics', 'hardware']):
+            return 'electronics_design'
+        elif any(keyword in message_lower for keyword in ['architecture', 'system', 'design']):
+            return 'system_architecture'
+        elif any(keyword in message_lower for keyword in ['documentation', 'document', 'write']):
+            return 'technical_documentation'
+        else:
+            return 'general_technical'
+
+    def _get_professional_fallback(self) -> str:
+        """Provide professional fallback response"""
+        return """I apologize, but I'm experiencing technical difficulties generating a comprehensive response at the moment. 
+
+However, I'm here to help with:
+• Software development and code optimization
+• Electronics design and circuit analysis  
+• System architecture and scalability planning
+• Technical documentation and best practices
+
+Please try rephrasing your question or specify if you'd like a response in a particular word count range (50-3000 words). I'll do my best to provide you with detailed, professional assistance."""
+
+    def generate_email_reply_with_enhanced_context(self, document_content: str, user_request: str, context: Dict = None) -> Dict:
+        """Generate enhanced email reply with professional formatting"""
         try:
-            # Check if user is asking for email generation
-            email_keywords = [
-                'generate reply', 'create reply', 'write reply', 'email reply',
-                'respond to', 'draft reply', 'compose reply', 'reply to this',
-                'generate email', 'create email', 'write email', 'draft email',
-                'professional reply', 'formal reply', 'make email', 'write an email'
-            ]
-            
-            is_email_request = any(keyword in user_message.lower() for keyword in email_keywords)
-            
-            if is_email_request:
-                # Use the email generation method with full context
-                context = {
-                    'document_subject': selected_file.get('subject', 'Unknown'),
-                    'chat_history': chat_history,
-                    'document_content': document_content,
-                    'thread_id': selected_file.get('thread_id', '')
-                }
-                return self.generate_email_reply_with_context(
-                    document_content, 
-                    user_message, 
-                    context
-                )
-            
-            # Regular chat response with conversation memory
-            conversation_context = self._build_conversation_context(chat_history, user_message)
-            
-            context_prompt = f"""You are an AI assistant with perfect memory helping with document analysis and email generation. You remember ALL previous conversations in this session.
+            system_prompt = """You are a Professional Email Assistant. Generate formal, well-structured email replies for technical and business communications.
 
-DOCUMENT SUMMARY:
-Subject: "{selected_file.get('subject', 'Unknown')}"
-Content: {document_content[:1000]}...
+EMAIL FORMATTING GUIDELINES:
+- Use proper email structure (Subject, Greeting, Body, Closing)
+- Maintain professional tone throughout
+- Include relevant technical details when appropriate
+- Keep emails concise but comprehensive
+- Use proper business email etiquette
 
-COMPLETE CONVERSATION CONTEXT:
-{conversation_context}
+TECHNICAL EMAIL SPECIALIZATION:
+- Software development project updates
+- Technical requirement discussions
+- System architecture proposals  
+- Code review feedback
+- Documentation and specification reviews"""
 
-CURRENT USER MESSAGE: {user_message}
+            enhanced_prompt = f"""
+DOCUMENT CONTEXT:
+{document_content[:2000]}
 
-IMPORTANT: 
-- Remember ALL previous information the user has shared
-- Build upon previous requests and conversations
-- If user is adding more details, combine them with previous information
-- Provide helpful responses that acknowledge the full conversation history
+EMAIL REQUEST: {user_request}
 
-You can help with:
-- Analyzing the document and answering questions
-- Generating different types of email replies
-- Modifying tone and style based on accumulated preferences
-- Including specific information from our entire conversation
-- General guidance based on our discussion history
-
-Please provide a helpful response that considers our ENTIRE conversation:"""
+Generate a professional email reply that addresses the request while referencing the document content appropriately. Use formal business email structure and technical terminology where suitable.
+"""
 
             payload = {
                 "model": self.model,
-                "prompt": context_prompt,
+                "system": system_prompt,
+                "prompt": enhanced_prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.8,
-                    "num_predict": 500,
-                    "top_p": 0.9,
-                    "repeat_penalty": 1.1
+                    "temperature": 0.6,
+                    "top_p": 0.8,
+                    "num_predict": 800
                 }
             }
 
@@ -158,209 +294,41 @@ Please provide a helpful response that considers our ENTIRE conversation:"""
 
             if response.status_code == 200:
                 result = response.json()
+                email_content = result.get('response', '').strip()
+                
                 return {
                     'success': True,
-                    'response': result.get('response', '').strip()
+                    'response': email_content,
+                    'word_count': len(email_content.split()),
+                    'response_type': 'professional_email',
+                    'model': self.model
                 }
             else:
-                return {
-                    'success': False,
-                    'response': 'I encountered an error. Please try again.'
-                }
+                return {'success': False, 'error': f'Email generation error: {response.status_code}'}
 
         except Exception as e:
-            logger.error(f"Error in contextual chat: {str(e)}")
-            return {
-                'success': False,
-                'response': 'I encountered an error. Please try again.'
-            }
+            logger.error(f"Error in enhanced email generation: {str(e)}")
+            return {'success': False, 'error': f'Enhanced email error: {str(e)}'}
 
-    def _build_conversation_context(self, chat_history: List, current_message: str) -> str:
-        """Build comprehensive conversation context from chat history"""
-        if not chat_history:
-            return f"This is the first message in our conversation: {current_message}"
-        
-        context_parts = []
-        context_parts.append("=== COMPLETE CONVERSATION HISTORY ===")
-        
-        # Group related information
-        user_requests = []
-        ai_responses = []
-        email_replies = []
-        
-        for i, msg in enumerate(chat_history, 1):
-            timestamp = msg.get('timestamp', 'Unknown time')
-            
-            if msg.get('isUser', False):
-                user_requests.append(f"User Request {i} ({timestamp}): {msg.get('text', '')}")
-            elif msg.get('isReply', False):
-                email_replies.append(f"Generated Email {i} ({timestamp}): {msg.get('text', '')}")
-            else:
-                ai_responses.append(f"AI Response {i} ({timestamp}): {msg.get('text', '')}")
-        
-        # Add all user requests
-        if user_requests:
-            context_parts.append("\n=== ALL USER REQUESTS AND INFORMATION ===")
-            context_parts.extend(user_requests)
-        
-        # Add AI responses for context
-        if ai_responses:
-            context_parts.append("\n=== PREVIOUS AI RESPONSES ===")
-            context_parts.extend(ai_responses[-3:])  # Last 3 responses
-        
-        # Add generated emails
-        if email_replies:
-            context_parts.append("\n=== PREVIOUSLY GENERATED EMAILS ===")
-            context_parts.extend(email_replies[-2:])  # Last 2 emails
-        
-        # Extract key information patterns
-        all_user_text = " ".join([msg.get('text', '') for msg in chat_history if msg.get('isUser', False)])
-        all_user_text += " " + current_message
-        
-        # Look for important information patterns
-        important_info = self._extract_important_information(all_user_text)
-        if important_info:
-            context_parts.append(f"\n=== KEY INFORMATION TO REMEMBER ===")
-            context_parts.append(important_info)
-        
-        context_parts.append(f"\n=== CURRENT REQUEST ===")
-        context_parts.append(f"Current message: {current_message}")
-        
-        return "\n".join(context_parts)
-
-    def _extract_important_information(self, all_text: str) -> str:
-        """Extract important information patterns from all user messages"""
-        important_patterns = []
-        
-        # Email addresses
-        import re
-        emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', all_text)
-        if emails:
-            important_patterns.append(f"Email addresses mentioned: {', '.join(set(emails))}")
-        
-        # Names (capitalized words that might be names)
-        names = re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', all_text)
-        if names:
-            important_patterns.append(f"Names mentioned: {', '.join(set(names))}")
-        
-        # Dates
-        dates = re.findall(r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b', all_text)
-        if dates:
-            important_patterns.append(f"Dates mentioned: {', '.join(set(dates))}")
-        
-        # Numbers and amounts
-        amounts = re.findall(r'\$[\d,]+\.?\d*|\b\d+[\d,]*\.?\d*\b(?:\s*(?:dollars|USD|EUR|pounds))?', all_text)
-        if amounts:
-            important_patterns.append(f"Amounts/Numbers: {', '.join(set(amounts))}")
-        
-        # Keywords indicating tone or style preferences
-        tone_keywords = re.findall(r'\b(?:formal|informal|professional|casual|urgent|polite|friendly|brief|detailed)\b', all_text.lower())
-        if tone_keywords:
-            important_patterns.append(f"Tone preferences: {', '.join(set(tone_keywords))}")
-        
-        # Specific requirements or instructions
-        requirements = re.findall(r'(?:include|mention|add|make sure|don\'t forget|remember to|please)\s+[^.!?]*', all_text.lower())
-        if requirements:
-            important_patterns.append(f"Specific requirements: {'; '.join(requirements[:3])}")
-        
-        return "\n".join(important_patterns) if important_patterns else ""
-
-    def _format_email_reply(self, raw_email: str) -> str:
-        """Format raw email text into properly structured email with line breaks and sections"""
-        lines = [line.strip() for line in raw_email.split('\n') if line.strip()]
-        
-        formatted_sections = []
-        current_section = []
-        
-        subject_line = ""
-        greeting = ""
-        body_paragraphs = []
-        closing = ""
-        signature = ""
-        
-        # Process lines to identify sections
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            
-            # Detect subject line
-            if line.lower().startswith(('subject:', 're:', 'fw:')):
-                subject_line = line
-            
-            # Detect greeting
-            elif line.lower().startswith(('dear ', 'hello ', 'hi ', 'greetings')):
-                greeting = line
-            
-            # Detect closing phrases
-            elif line.lower().startswith(('best regards', 'sincerely', 'thank you', 'thanks', 'kind regards', 'yours truly')):
-                closing = line
-                if i + 1 < len(lines):
-                    signature = lines[i + 1]
-                    i += 1
-            
-            # Everything else goes to body
-            else:
-                if line and not line.lower().startswith(('please note', 'note:')):
-                    body_paragraphs.append(line)
-            
-            i += 1
-        
-        # Build the formatted email
-        formatted_email = ""
-        
-        if subject_line:
-            formatted_email += f"{subject_line}\n\n"
-        
-        if greeting:
-            formatted_email += f"{greeting}\n\n"
-        
-        # Process body paragraphs
-        if body_paragraphs:
-            current_paragraph = []
-            
-            for line in body_paragraphs:
-                if line.startswith(('* ', '• ', '- ', '1. ', '2. ', '3. ', '4. ', '5. ')):
-                    if current_paragraph:
-                        formatted_email += ' '.join(current_paragraph) + "\n\n"
-                        current_paragraph = []
-                    formatted_email += f"{line}\n"
-                
-                elif line.endswith(('.', '!', '?', ':')):
-                    current_paragraph.append(line)
-                    if len(' '.join(current_paragraph)) > 100:
-                        formatted_email += ' '.join(current_paragraph) + "\n\n"
-                        current_paragraph = []
-                else:
-                    current_paragraph.append(line)
-            
-            if current_paragraph:
-                formatted_email += ' '.join(current_paragraph) + "\n\n"
-        
-        if closing:
-            formatted_email += f"{closing}\n"
-        
-        if signature:
-            formatted_email += f"{signature}\n"
-        
-        return formatted_email.strip()
-
-    # ... (keep other existing methods like check_health, etc.)
-    
     def check_health(self) -> Dict:
-        """Check if Ollama service is healthy"""
+        """Enhanced health check with professional capabilities"""
         try:
-            response = requests.get(f"{self.base_url}/api/tags", timeout=10)
+            response = requests.get(f"{self.base_url}/api/version", timeout=5)
             if response.status_code == 200:
-                models = response.json().get('models', [])
-                model_available = any(
-                    model.get('name', '').startswith(self.model)
-                    for model in models
-                )
                 return {
                     'healthy': True,
-                    'model_available': model_available,
-                    'models': [m.get('name') for m in models]
+                    'service': 'Enhanced Professional AI',
+                    'capabilities': [
+                        'Software Development Expertise',
+                        'Electronics Engineering',
+                        'System Architecture',
+                        'Technical Documentation',
+                        'Word Count Control (50-3000)',
+                        'Professional Email Generation'
+                    ],
+                    'version': response.json().get('version', 'unknown')
                 }
-            return {'healthy': False, 'error': 'Service unavailable'}
+            else:
+                return {'healthy': False, 'error': f'Service unavailable: {response.status_code}'}
         except Exception as e:
-            return {'healthy': False, 'error': str(e)}
+            return {'healthy': False, 'error': f'Health check failed: {str(e)}'}

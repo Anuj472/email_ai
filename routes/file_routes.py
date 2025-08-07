@@ -1,7 +1,8 @@
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from services.file_service import FileService
 from services.ollama_service import OllamaService
 import os
+import requests
 import logging
 
 logger = logging.getLogger(__name__)
@@ -86,27 +87,6 @@ def list_replied_files():
         logger.error(f"Error listing replied files: {str(e)}")
         return jsonify({'success': False, 'error': 'Failed to list replied files'}), 500
 
-# ✅ FIXED: Changed from /thread/ to /thread/<filename>
-@file_bp.route('/thread/<filename>', methods=['GET'])
-def get_thread_info(filename):
-    """Get complete thread information for a file"""
-    try:
-        file_service = FileService(current_app.config['UPLOAD_FOLDER'])
-        thread_info = file_service.get_thread_info(filename)
-
-        if not thread_info:
-            return jsonify({'success': False, 'error': 'Thread not found'}), 404
-
-        return jsonify({
-            'success': True,
-            'thread_info': thread_info
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting thread info: {str(e)}")
-        return jsonify({'success': False, 'error': 'Failed to get thread info'}), 500
-
-# ✅ FIXED: Changed from /content/ to /content/<filename>
 @file_bp.route('/content/<filename>', methods=['GET'])
 def get_file_content(filename):
     """Get full content of a file"""
@@ -117,7 +97,6 @@ def get_file_content(filename):
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'error': 'File not found'}), 404
 
-        # Get file metadata and full content
         file_info = file_service._get_file_metadata(filename)
         text_content = file_service.extract_pdf_text(filepath) if filename.endswith('.pdf') else ""
 
@@ -132,10 +111,86 @@ def get_file_content(filename):
         logger.error(f"Error getting file content: {str(e)}")
         return jsonify({'success': False, 'error': 'Failed to get file content'}), 500
 
-# ✅ FIXED: All other routes with similar pattern corrections...
+@file_bp.route('/summarize/<filename>', methods=['POST'])
+def summarize_document(filename):
+    """Generate document summary with specified word limit"""
+    try:
+        data = request.get_json()
+        word_limit = data.get('word_limit', 500)
+        
+        file_service = FileService(current_app.config['UPLOAD_FOLDER'])
+        filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
+
+        if not os.path.exists(filepath):
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+
+        file_info = file_service._get_file_metadata(filename)
+        if not file_info:
+            return jsonify({'success': False, 'error': 'File metadata not found'}), 404
+
+        if filename.lower().endswith('.pdf'):
+            text_content = file_service.extract_pdf_text(filepath)
+        else:
+            return jsonify({'success': False, 'error': 'Unsupported file type for summarization'}), 400
+
+        if not text_content:
+            return jsonify({'success': False, 'error': 'Could not extract text for summarization'}), 400
+
+        summary_prompt = f"""Please provide a comprehensive summary of the following document in exactly {word_limit} words. 
+        
+        Document Content:
+        {text_content[:4000]}...
+        
+        Instructions:
+        - Write a clear, concise summary that captures the main points
+        - Use approximately {word_limit} words (can be slightly under or over)
+        - Structure the summary with clear paragraphs
+        - Focus on key information, decisions, and important details
+        - Write in a professional tone
+        
+        Summary:"""
+
+        payload = {
+            "model": current_app.config['OLLAMA_MODEL'],
+            "prompt": summary_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.6,
+                "num_predict": min(word_limit * 2, 1000)
+            }
+        }
+
+        response = requests.post(
+            f"{current_app.config['OLLAMA_BASE_URL']}/api/generate",
+            json=payload,
+            timeout=120
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            summary = result.get('response', '').strip()
+            summary = summary.replace('\n\n\n', '\n\n')
+            
+            return jsonify({
+                'success': True,
+                'summary': summary,
+                'word_limit': word_limit,
+                'document_subject': file_info.get('subject', ''),
+                'filename': filename
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to generate summary'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Error summarizing document: {str(e)}")
+        return jsonify({'success': False, 'error': 'Summarization failed'}), 500
+
 @file_bp.route('/generate-reply/<filename>', methods=['POST'])
 def generate_reply(filename):
-    """Generate reply for a specific document with enhanced PDF support"""
+    """Generate reply for a specific document (triggers dual-pane view)"""
     try:
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
         filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
@@ -143,12 +198,10 @@ def generate_reply(filename):
         if not os.path.exists(filepath):
             return jsonify({'success': False, 'error': 'File not found'}), 404
 
-        # Get file metadata
         file_info = file_service._get_file_metadata(filename)
         if not file_info:
             return jsonify({'success': False, 'error': 'File metadata not found'}), 404
 
-        # Extract full text content
         if filename.lower().endswith('.pdf'):
             text_content = file_service.extract_pdf_text(filepath)
         else:
@@ -163,39 +216,48 @@ def generate_reply(filename):
             'subject': file_info.get('subject', ''),
             'document_content': text_content,
             'file_info': file_info,
-            'show_dual_pane': True  # ✅ ADDED: Triggers dual-pane view
+            'show_dual_pane': True
         })
 
     except Exception as e:
         logger.error(f"Error generating reply: {str(e)}")
         return jsonify({'success': False, 'error': 'Reply generation failed'}), 500
 
-
-# Continue with other corrected routes...
 @file_bp.route('/mark-replied/<filename>', methods=['POST'])
 def mark_replied(filename):
-    """Mark a file as having reply generated with final reply content"""
+    """Mark a file as completed - only move to completed if manually marked"""
     try:
         data = request.get_json()
         reply_content = data.get('reply_content', '')
+        manual_completion = data.get('manual_completion', False)  # ✅ NEW: Check if manually marked
 
         if not reply_content:
             return jsonify({'success': False, 'error': 'Reply content is required'}), 400
 
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
-        success = file_service.mark_reply_generated(filename, reply_content)
-
-        if success:
+        
+        # ✅ FIXED: Only mark as replied if manually completed
+        if manual_completion:
+            success = file_service.mark_reply_generated(filename, reply_content)
+            if success:
+                return jsonify({
+                    'success': True,
+                    'message': 'File marked as completed successfully'
+                })
+            else:
+                return jsonify({'success': False, 'error': 'Failed to mark as completed'}), 400
+        else:
+            # ✅ For automatic email generation, don't move to completed section
+            # Just save the chat message, don't change completion status
             return jsonify({
                 'success': True,
-                'message': 'File marked as replied successfully'
+                'message': 'Reply generated but not marked as completed'
             })
-        else:
-            return jsonify({'success': False, 'error': 'Failed to mark as replied'}), 400
 
     except Exception as e:
         logger.error(f"Error marking as replied: {str(e)}")
         return jsonify({'success': False, 'error': 'Failed to mark as replied'}), 500
+
 
 @file_bp.route('/delete/<filename>', methods=['DELETE'])
 def delete_file(filename):
@@ -216,60 +278,12 @@ def delete_file(filename):
         logger.error(f"Error deleting file: {str(e)}")
         return jsonify({'success': False, 'error': 'Failed to delete file'}), 500
 
-# ✅ FIXED: All remaining routes with parameter corrections
-@file_bp.route('/thread/<filename>/summary', methods=['GET'])
-def get_thread_summary(filename):
-    """Get a summary of the chat thread for a specific file"""
-    try:
-        file_service = FileService(current_app.config['UPLOAD_FOLDER'])
-        thread_info = file_service.get_thread_info(filename)
-
-        if not thread_info:
-            return jsonify({'success': False, 'error': 'Thread not found'}), 404
-
-        chat_history = thread_info.get('chat_history', [])
-
-        # Calculate thread statistics
-        total_messages = len(chat_history)
-        user_messages = len([msg for msg in chat_history if msg.get('isUser', False)])
-        ai_messages = len([msg for msg in chat_history if not msg.get('isUser', False)])
-        email_replies = len([msg for msg in chat_history if msg.get('isReply', False)])
-
-        # Get the latest activity timestamp
-        latest_activity = None
-        if chat_history:
-            latest_message = max(chat_history, key=lambda x: x.get('timestamp', ''))
-            latest_activity = latest_message.get('timestamp')
-
-        return jsonify({
-            'success': True,
-            'thread_summary': {
-                'filename': filename,
-                'subject': thread_info.get('subject', ''),
-                'thread_id': thread_info.get('thread_id', ''),
-                'total_messages': total_messages,
-                'user_messages': user_messages,
-                'ai_messages': ai_messages,
-                'email_replies_generated': email_replies,
-                'has_final_reply': thread_info.get('has_reply', False),
-                'latest_activity': latest_activity,
-                'upload_date': thread_info.get('upload_date', ''),
-                'due_date': thread_info.get('due_date', ''),
-                'status': 'completed' if thread_info.get('has_reply', False) else 'active' if total_messages > 0 else 'pending'
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"Error getting thread summary: {str(e)}")
-        return jsonify({'success': False, 'error': 'Failed to get thread summary'}), 500
-
 @file_bp.route('/stats', methods=['GET'])
 def get_file_statistics():
     """Get overall file and thread statistics"""
     try:
         file_service = FileService(current_app.config['UPLOAD_FOLDER'])
 
-        # Get all files
         all_files = []
         try:
             for filename in os.listdir(current_app.config['UPLOAD_FOLDER']):
@@ -284,7 +298,6 @@ def get_file_statistics():
         pending_files = len([f for f in all_files if not f.get('has_reply', False)])
         completed_files = len([f for f in all_files if f.get('has_reply', False)])
 
-        # Calculate chat statistics
         total_messages = 0
         active_threads = 0
 
@@ -309,3 +322,29 @@ def get_file_statistics():
     except Exception as e:
         logger.error(f"Error getting statistics: {str(e)}")
         return jsonify({'success': False, 'error': 'Failed to get statistics'}), 500
+    
+@file_bp.route('/view/<filename>', methods=['GET'])
+def view_pdf_file(filename):
+    """Serve PDF file for viewing in browser"""
+    try:
+        from flask import send_from_directory
+        
+        file_service = FileService(current_app.config['UPLOAD_FOLDER'])
+        filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
+        
+        if not os.path.exists(filepath):
+            return jsonify({'error': 'File not found'}), 404
+            
+        if not filename.lower().endswith('.pdf'):
+            return jsonify({'error': 'Not a PDF file'}), 400
+        
+        return send_from_directory(
+            current_app.config['UPLOAD_FOLDER'], 
+            filename,
+            mimetype='application/pdf',
+            as_attachment=False
+        )
+        
+    except Exception as e:
+        logger.error(f"Error serving PDF: {str(e)}")
+        return jsonify({'error': 'Failed to serve PDF'}), 500
